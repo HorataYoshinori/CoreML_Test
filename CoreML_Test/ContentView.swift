@@ -4,7 +4,6 @@
 //
 //  Created by 洞田 佳範 on 2025/10/15.
 //
-// test
 
 import SwiftUI
 import UIKit
