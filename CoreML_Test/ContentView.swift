@@ -1,8 +1,8 @@
 //
-//  ContentView.swift
+//  ContentView.swift — rewritten
 //  CoreML_Test
 //
-//  Created by 洞田 佳範 on 2025/10/15.
+//  Updated: 2025/10/20
 //
 
 import SwiftUI
@@ -16,11 +16,12 @@ import Combine
 
 struct ContentView: View {
     @StateObject private var vm = CameraVM()
+    
     var body: some View {
         ZStack {
             CameraPreview(session: vm.session) { layer in
                 vm.previewLayer = layer
-                // 起動は modelReady でのみ（ここでは start しない）
+                // 起動は modelReady のみ（ここでは start しない）
             }
             .ignoresSafeArea()
 
@@ -32,23 +33,33 @@ struct ContentView: View {
             }
 
             if vm.cameraDenied {
-                Text("設定 > プライバシー > カメラ で本アプリを許可してください")
-                    .padding()
-                    .background(.ultraThinMaterial)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .padding()
+                VStack(spacing: 12) {
+                    Text("設定 > プライバシー > カメラ で本アプリを許可してください")
+                        .multilineTextAlignment(.center)
+                    Button("設定を開く") {
+                        if let url = URL(string: UIApplication.openSettingsURLString) {
+                            UIApplication.shared.open(url)
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .padding()
+                .background(.ultraThinMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .padding()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             vm.stop()
         }
-        // 起動は modelReady のみで統一（プレビューLayerがあることを確認）
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            if vm.modelReady, vm.previewLayer != nil { vm.start() }
+        }
+        // 起動は modelReady のみ（プレビューLayerがあることを確認）
         .onChange(of: vm.modelReady) { ready in
             if ready, vm.previewLayer != nil {
                 // レイアウト安定のため少し遅らせる（ハング検知抑制）
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    vm.start()
-                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { vm.start() }
             }
         }
     }
@@ -68,18 +79,21 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     fileprivate var previewLayer: AVCaptureVideoPreviewLayer?
     private let sessionQueue = DispatchQueue(label: "pill.session.queue")
 
+    // Capture / Infer を分離
+    private let captureQueue = DispatchQueue(label: "pill.capture.queue", qos: .userInitiated)
+    private let inferQueue   = DispatchQueue(label: "pill.infer.queue", qos: .userInitiated)
+
     // Vision
     private var request: VNCoreMLRequest?
     private var didSetupRequest = false  // 二重構築ガード
     private let confThresh: VNConfidence = 0.10
 
     // 実行制御
-    private let queue = DispatchQueue(label: "pill.infer.queue", qos: .userInitiated)
     private let inferSemaphore = DispatchSemaphore(value: 1)
     private var lastInferTime = CFAbsoluteTimeGetCurrent()
     private let inferInterval: CFTimeInterval = 0.30 // ≈3.3fps
     private var lastUIUpdate = CFAbsoluteTimeGetCurrent()
-    private let uiInterval: CFTimeInterval = 0.10    // UIは最大10fps
+    private let uiInterval: CFTimeInterval = 0.10    // UI は最大 10fps
 
     override init() {
         super.init()
@@ -87,7 +101,7 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         sessionQueue.async { [weak self] in
             self?.setupCamera()
         }
-        // モデル非同期ロード（必要ならCPU限定の非同期リトライ）
+        // モデル非同期ロード（必要なら CPU 限定のフォールバック）
         setupVision()
     }
 
@@ -148,7 +162,7 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         let output = AVCaptureVideoDataOutput()
         output.alwaysDiscardsLateVideoFrames = true
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-        output.setSampleBufferDelegate(self, queue: queue)
+        output.setSampleBufferDelegate(self, queue: captureQueue)
         if session.canAddOutput(output) { session.addOutput(output) }
         if let conn = output.connection(with: .video), conn.isVideoOrientationSupported {
             conn.videoOrientation = .portrait
@@ -202,7 +216,7 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                     self.buildVNModelAndRequest(model) // request セット→warmUp→ready は buildVisionRequest 内
                 case .failure(let err):
                     print("[ERROR] MLModel.load(.cpuAndGPU) failed:", err.localizedDescription)
-                    // 失敗はCPUフォールバックに任せる
+                    // 失敗は CPU フォールバックに任せる
                 }
             }
             // 2) 6秒以内に戻らなければ .cpuOnly で非同期リトライ
@@ -224,7 +238,7 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                 }
             }
         } else {
-            // iOS14以下はバックグラウンド同期
+            // iOS14 以下はバックグラウンド同期
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self else { return }
                 do {
@@ -263,28 +277,18 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         didSetupRequest = true
 
         let req = VNCoreMLRequest(model: vnModel) { [weak self] request, _ in
-            guard let self, let pl = self.previewLayer else { return }
+            guard let self else { return }
             let obs = (request.results as? [VNRecognizedObjectObservation]) ?? []
-
-            var rects: [DrawBox] = []
-            for o in obs.sorted(by: { $0.confidence > $1.confidence }).prefix(60) {
-                guard o.confidence >= self.confThresh else { continue }
-                let v = o.boundingBox
-                let meta = CGRect(x: v.minX, y: 1 - v.minY - v.height, width: v.width, height: v.height)
-                let layerRect = pl.layerRectConverted(fromMetadataOutputRect: meta)
-
-                let area = layerRect.width * layerRect.height
-                guard area >= 16 * 16 else { continue }
-
-                rects.append(DrawBox(rect: layerRect,
-                                     score: o.confidence,
-                                     label: o.labels.first?.identifier ?? "pill"))
-            }
 
             let now = CFAbsoluteTimeGetCurrent()
             guard now - self.lastUIUpdate >= self.uiInterval else { return }
             self.lastUIUpdate = now
-            DispatchQueue.main.async { self.boxes = rects }
+
+            // レイヤー変換＋UI 更新はメインへ
+            DispatchQueue.main.async {
+                guard let pl = self.previewLayer else { return }
+                self.boxes = self.convertToLayerRects(obs, previewLayer: pl)
+            }
         }
         req.imageCropAndScaleOption = .scaleFill
 
@@ -292,7 +296,7 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         print("[DEBUG] request built ✅")
 
         // ウォームアップは重いので BG で
-        queue.async { [weak self] in
+        inferQueue.async { [weak self] in
             guard let self else { return }
             self.warmUp()
             print("[DEBUG] warmUp done (background)")
@@ -303,13 +307,12 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         }
     }
 
-    // 初回だけダミー入力で perform（Metal/BNNS初期化をここで済ませる）
+    // 初回だけダミー入力で perform（Metal/BNNS 初期化をここで済ませる）
     private func warmUp() {
         guard let req = self.request else { return }
-        // 320x320 で軽量ウォームアップ（多くのカーネルはこれで十分）
         if let pb = Self.makePixelBuffer(width: 320, height: 320) {
             let h = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .up, options: [:])
-            _ = try? h.perform([req]) // 結果は捨てる
+            _ = try? h.perform([req]) // 結果は捨てる（UI 側は previewLayer が無ければ無視）
         }
     }
 
@@ -323,22 +326,51 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         lastInferTime = now
 
         guard inferSemaphore.wait(timeout: .now()) == .success else { return }
-        queue.async { [weak self] in
+
+        inferQueue.async { [weak self] in
             defer { self?.inferSemaphore.signal() }
-            guard let self else { return }
-            autoreleasepool {
-                guard let pixel = CMSampleBufferGetImageBuffer(sb) else { return }
-                let h = VNImageRequestHandler(cvPixelBuffer: pixel, orientation: .up, options: [:])
-                do {
-                    try h.perform([request])
-                } catch {
-                    print("[ERROR] VN perform: \(error)")
-                }
+            guard let self = self, let pixel = CMSampleBufferGetImageBuffer(sb) else { return }
+            let orient = self.currentImageOrientation()
+            let h = VNImageRequestHandler(cvPixelBuffer: pixel, orientation: orient, options: [:])
+            do {
+                try h.perform([request])
+            } catch {
+                print("[ERROR] VN perform: \(error)")
             }
         }
     }
 
     // MARK: Utils
+
+    // 端末の現在向きから CGImagePropertyOrientation を推定
+    private func currentImageOrientation() -> CGImagePropertyOrientation {
+        // プレビューは常に portrait に設定している前提。
+        // 背面カメラの縦持ちでは .right が自然になるケースが多い。
+        switch UIDevice.current.orientation {
+        case .portrait:            return .right
+        case .portraitUpsideDown:  return .left
+        case .landscapeLeft:       return .up   // ホームボタンが右（古い表現）
+        case .landscapeRight:      return .down // ホームボタンが左（古い表現）
+        default:                   return .right
+        }
+    }
+
+    // 正規化座標 → プレビュー Layer 座標（メインスレッドで呼ぶ）
+    private func convertToLayerRects(_ obs: [VNRecognizedObjectObservation], previewLayer pl: AVCaptureVideoPreviewLayer) -> [DrawBox] {
+        var rects: [DrawBox] = []
+        for o in obs.sorted(by: { $0.confidence > $1.confidence }).prefix(60) {
+            guard o.confidence >= self.confThresh else { continue }
+            let v = o.boundingBox
+            let meta = CGRect(x: v.minX, y: 1 - v.minY - v.height, width: v.width, height: v.height)
+            let layerRect = pl.layerRectConverted(fromMetadataOutputRect: meta)
+            let area = layerRect.width * layerRect.height
+            guard area >= 16 * 16 else { continue }
+            rects.append(DrawBox(rect: layerRect,
+                                 score: o.confidence,
+                                 label: o.labels.first?.identifier ?? "pill"))
+        }
+        return rects
+    }
 
     private static func makePixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
         var pb: CVPixelBuffer?
@@ -376,7 +408,7 @@ struct CameraPreview: UIViewRepresentable {
     }
 }
 
-// MARK: - Overlay（軽量Canvas）
+// MARK: - Overlay（軽量 Canvas）
 
 struct PillOverlay: View {
     let boxes: [DrawBox]
