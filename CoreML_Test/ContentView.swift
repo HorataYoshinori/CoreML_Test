@@ -94,6 +94,8 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     private let inferInterval: CFTimeInterval = 0.30 // ≈3.3fps
     private var lastUIUpdate = CFAbsoluteTimeGetCurrent()
     private let uiInterval: CFTimeInterval = 0.10    // UI は最大 10fps
+    // 最新のピクセルバッファ寸法（画像オリエンテーション適用後）
+    private var lastPixelBufferSize: CGSize?
 
     override init() {
         super.init()
@@ -320,6 +322,18 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard modelReady, let request = self.request else { return }
+        
+        if let pixel = CMSampleBufferGetImageBuffer(sb) {
+            let w = CVPixelBufferGetWidth(pixel)
+            let h = CVPixelBufferGetHeight(pixel)
+            let orient = currentImageOrientation()
+            switch orient {
+            case .right, .left, .rightMirrored, .leftMirrored:
+                lastPixelBufferSize = CGSize(width: h, height: w)  // 90/270°は入れ替え
+            default:
+                lastPixelBufferSize = CGSize(width: w, height: h)
+            }
+        }
 
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastInferTime >= inferInterval else { return }
@@ -355,21 +369,85 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         }
     }
 
-    // 正規化座標 → プレビュー Layer 座標（メインスレッドで呼ぶ）
-    private func convertToLayerRects(_ obs: [VNRecognizedObjectObservation], previewLayer pl: AVCaptureVideoPreviewLayer) -> [DrawBox] {
+    private func convertToLayerRects(
+        _ obs: [VNRecognizedObjectObservation],
+        previewLayer pl: AVCaptureVideoPreviewLayer
+    ) -> [DrawBox] {
+        guard let frameSize = lastPixelBufferSize else { return [] }
+
+        // プレビュー内の実映像領域
+        let videoBox = Self.videoPreviewBox(for: pl, pixelSize: frameSize)
+
         var rects: [DrawBox] = []
         for o in obs.sorted(by: { $0.confidence > $1.confidence }).prefix(60) {
             guard o.confidence >= self.confThresh else { continue }
+
+            // Visionの正規化（左下原点）→ 左上原点へ反転
             let v = o.boundingBox
-            let meta = CGRect(x: v.minX, y: 1 - v.minY - v.height, width: v.width, height: v.height)
-            let layerRect = pl.layerRectConverted(fromMetadataOutputRect: meta)
+            let normTop = CGRect(x: v.minX,
+                                 y: 1 - v.minY - v.height,
+                                 width: v.width,
+                                 height: v.height)
+
+            // videoBox 内に射影（アスペクト差は videoBox が吸収）
+            let layerRect = CGRect(
+                x: videoBox.origin.x + normTop.origin.x * videoBox.width,
+                y: videoBox.origin.y + normTop.origin.y * videoBox.height,
+                width:  normTop.width  * videoBox.width,
+                height: normTop.height * videoBox.height
+            )
+
             let area = layerRect.width * layerRect.height
             guard area >= 16 * 16 else { continue }
+
             rects.append(DrawBox(rect: layerRect,
                                  score: o.confidence,
                                  label: o.labels.first?.identifier ?? "pill"))
         }
         return rects
+    }
+    
+    /// プレビュー内で実際に映像が描かれている矩形（AspectFill/AspectFit 両対応）
+    static func videoPreviewBox(for layer: AVCaptureVideoPreviewLayer, pixelSize: CGSize) -> CGRect {
+        let viewSize = layer.bounds.size
+        guard viewSize.width > 0, viewSize.height > 0,
+              pixelSize.width > 0, pixelSize.height > 0 else {
+            return layer.bounds
+        }
+        let videoRatio = pixelSize.width / pixelSize.height
+        let viewRatio  = viewSize.width / viewSize.height
+
+        switch layer.videoGravity {
+        case .resizeAspectFill:
+            if viewRatio > videoRatio {
+                // 高さ基準で拡大（左右トリミング）
+                let height = viewSize.height
+                let width  = height * videoRatio
+                let x = (viewSize.width - width) / 2
+                return CGRect(x: x, y: 0, width: width, height: height)
+            } else {
+                // 幅基準で拡大（上下トリミング）
+                let width  = viewSize.width
+                let height = width / videoRatio
+                let y = (viewSize.height - height) / 2
+                return CGRect(x: 0, y: y, width: width, height: height)
+            }
+        case .resizeAspect:
+            // 黒帯ありで全体を収める
+            if viewRatio > videoRatio {
+                let width  = viewSize.height * videoRatio
+                let height = viewSize.height
+                let x = (viewSize.width - width) / 2
+                return CGRect(x: x, y: 0, width: width, height: height)
+            } else {
+                let width  = viewSize.width
+                let height = width / videoRatio
+                let y = (viewSize.height - height) / 2
+                return CGRect(x: 0, y: y, width: width, height: height)
+            }
+        default:
+            return layer.bounds // .resize など
+        }
     }
 
     private static func makePixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
