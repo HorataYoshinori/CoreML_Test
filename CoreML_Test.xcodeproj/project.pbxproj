@@ -10,6 +10,8 @@
 		8B4E6E512E9FBA2E00B579FA /* CoreML.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8B4E6E502E9FBA2E00B579FA /* CoreML.framework */; };
 		8B4E6E532E9FBA3900B579FA /* Vision.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8B4E6E522E9FBA3900B579FA /* Vision.framework */; };
 		8B4E6E552E9FBA4600B579FA /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8B4E6E542E9FBA4600B579FA /* AVFoundation.framework */; };
+		8BF0556B2EB1F8760004088C /* best.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = 8BF0556A2EB1F8760004088C /* best.mlpackage */; };
+		8BF0556E2EB1FDA30004088C /* .gitignore.txt in Resources */ = {isa = PBXBuildFile; fileRef = 8BF0556C2EB1FD8D0004088C /* .gitignore.txt */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -17,6 +19,8 @@
 		8B4E6E502E9FBA2E00B579FA /* CoreML.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreML.framework; path = System/Library/Frameworks/CoreML.framework; sourceTree = SDKROOT; };
 		8B4E6E522E9FBA3900B579FA /* Vision.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Vision.framework; path = System/Library/Frameworks/Vision.framework; sourceTree = SDKROOT; };
 		8B4E6E542E9FBA4600B579FA /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
+		8BF0556A2EB1F8760004088C /* best.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = best.mlpackage; sourceTree = "<group>"; };
+		8BF0556C2EB1FD8D0004088C /* .gitignore.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore.txt; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -44,6 +48,8 @@
 		8B4E6E342E9FB5AF00B579FA = {
 			isa = PBXGroup;
 			children = (
+				8BF0556C2EB1FD8D0004088C /* .gitignore.txt */,
+				8BF0556A2EB1F8760004088C /* best.mlpackage */,
 				8B4E6E3F2E9FB5AF00B579FA /* CoreML_Test */,
 				8B4E6E4F2E9FBA2E00B579FA /* Frameworks */,
 				8B4E6E3E2E9FB5AF00B579FA /* Products */,
@@ -132,6 +138,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				8BF0556E2EB1FDA30004088C /* .gitignore.txt in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -142,6 +149,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				8BF0556B2EB1F8760004088C /* best.mlpackage in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

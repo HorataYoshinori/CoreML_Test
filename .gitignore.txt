@@ -1,0 +1,27 @@
+cat > .gitignore <<'EOF'
+# Xcode
+DerivedData/
+*.xcuserdatad
+*.xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+# Build products
+build/
+# SwiftPM
+.build/
+# CocoaPods
+Pods/
+# Carthage
+Carthage/Build/
+# Archives
+*.xcarchive
+# Fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots
+# CoreML training artifacts (keep mlpackage tracked by LFS above)
+*.mlmodelc
+EOF
+
+git add .gitignore
+
