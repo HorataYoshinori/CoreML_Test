@@ -355,14 +355,11 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         if let pixel = CMSampleBufferGetImageBuffer(sb) {
             let w = CVPixelBufferGetWidth(pixel)
             let h = CVPixelBufferGetHeight(pixel)
-            #if compiler(>=5.9)
             if #available(iOS 17.0, *) {
-                // videoRotationAngle で 90/270 は縦持ち（幅高入替）
-                let rot = Int(connection.videoRotationAngle) % 360
-                switch rot {
-                case 90, 270:
+                let rot = (Int(connection.videoRotationAngle) % 360 + 360) % 360
+                if rot == 90 || rot == 270 {
                     lastPixelBufferSize = CGSize(width: h, height: w)
-                default:
+                } else {
                     lastPixelBufferSize = CGSize(width: w, height: h)
                 }
             } else {
@@ -375,16 +372,6 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                     lastPixelBufferSize = CGSize(width: w, height: h)
                 }
             }
-            #else
-            switch connection.videoOrientation {
-            case .portrait, .portraitUpsideDown:
-                lastPixelBufferSize = CGSize(width: h, height: w)
-            case .landscapeLeft, .landscapeRight:
-                lastPixelBufferSize = CGSize(width: w, height: h)
-            @unknown default:
-                lastPixelBufferSize = CGSize(width: w, height: h)
-            }
-            #endif
         }
 
         let now = CFAbsoluteTimeGetCurrent()
@@ -412,23 +399,32 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
 
     // MARK: Orientation (rotation-angle based for iOS17)
 
-    private func cgImageOrientation(for connection: AVCaptureConnection, devicePosition: AVCaptureDevice.Position) -> CGImagePropertyOrientation {
+    // CameraVM 内：置き換え
+    private func cgImageOrientation(
+        for connection: AVCaptureConnection,
+        devicePosition: AVCaptureDevice.Position
+    ) -> CGImagePropertyOrientation {
         let isFront = (devicePosition == .front)
 
-        var rotationAngle: CGFloat = 0
+        // 1) 回転角を取得（iOS17+ は videoRotationAngle、旧OSは videoOrientation から推定）
+        var angle: Int
         if #available(iOS 17.0, *) {
-            rotationAngle = CGFloat(connection.videoRotationAngle) // 0 / 90 / 180 / 270
+            angle = Int(connection.videoRotationAngle) % 360          // 0 / 90 / 180 / 270
         } else {
             switch connection.videoOrientation {
-            case .portrait:            rotationAngle = 90
-            case .portraitUpsideDown:  rotationAngle = 270
-            case .landscapeRight:      rotationAngle = 0
-            case .landscapeLeft:       rotationAngle = 180
-            @unknown default:          rotationAngle = 90
+            case .portrait:            angle = 90
+            case .portraitUpsideDown:  angle = 270
+            case .landscapeRight:      angle = 0
+            case .landscapeLeft:       angle = 180
+            @unknown default:          angle = 90
             }
         }
 
-        switch Int(rotationAngle) % 360 {
+        // 2) ★ ここが肝心：プレビューとのズレを解消するために 180°補正
+        let adjusted = (angle + 180) % 360
+
+        // 3) 角度＋前面/背面で CGImagePropertyOrientation を決定
+        switch adjusted {
         case 0:   return isFront ? .upMirrored    : .up
         case 90:  return isFront ? .leftMirrored  : .right
         case 180: return isFront ? .downMirrored  : .down
@@ -439,36 +435,35 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
 
     // MARK: 座標変換（PreviewLayer API を優先）
 
+    // CameraVM 内：置き換え
     private func convertToLayerRects(
         _ obs: [VNRecognizedObjectObservation],
         previewLayer pl: AVCaptureVideoPreviewLayer
     ) -> [DrawBox] {
-        guard lastPixelBufferSize != nil else { return [] }
-
         var rects: [DrawBox] = []
         for o in obs.sorted(by: { $0.confidence > $1.confidence }).prefix(40) {
             guard o.confidence >= self.confThresh else { continue }
 
-            // Vision 正規化（左下原点）→ 左上原点へ反転
+            // Vision 正規化（左下原点）→ メタデータ座標（左上原点）へ反転
             let v = o.boundingBox
-            let normTop = CGRect(x: v.minX,
-                                 y: 1 - v.minY - v.height,
-                                 width: v.width,
-                                 height: v.height)
+            let normTop = CGRect(
+                x: v.minX,
+                y: 1 - v.minY - v.height,       // ← y だけ反転（ここ重要）
+                width: v.width,
+                height: v.height
+            )
 
-            // 公式APIで 0..1 → レイヤ座標へ
+            // メタデータ(0..1, 左上原点) → レイヤ座標へ公式変換
             let layerRect = pl.layerRectConverted(fromMetadataOutputRect: normTop)
+            let clipped = layerRect.intersection(pl.bounds)
+            guard clipped.width >= 16, clipped.height >= 16 else { continue }
 
-            let area = layerRect.width * layerRect.height
-            guard area >= 16 * 16 else { continue }
-
-            rects.append(DrawBox(rect: layerRect,
+            rects.append(DrawBox(rect: clipped,
                                  score: o.confidence,
                                  label: o.labels.first?.identifier ?? "pill"))
         }
         return rects
     }
-
     // MARK: Utils
 
     private static func makePixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
