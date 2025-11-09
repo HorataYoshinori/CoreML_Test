@@ -1,8 +1,8 @@
 //
-//  ContentView.swift — iOS 17 deprecations fixed
+//  ContentView.swift — presets + FPS HUD + iOS17 fixes
 //  CoreML_Test
 //
-//  Updated: 2025/10/29
+//  Updated: 2025/10/30
 //
 
 import SwiftUI
@@ -12,23 +12,78 @@ import Vision
 import CoreML
 import Combine
 
+// MARK: - Presets
+
+struct DetectionPreset: Identifiable, Equatable {
+    let id = UUID()
+    let title: String
+    let maxBoxes: Int
+    let confThresh: VNConfidence
+    let minAreaPt: CGFloat         // レイヤ（ポイント）基準の最小面積
+    let useNMS: Bool
+    let iouThreshold: CGFloat      // NMSのIoU閾値
+    static let comfort80  = DetectionPreset(title: "快適 80",  maxBoxes: 80,  confThresh: 0.15, minAreaPt: 20*20, useNMS: true,  iouThreshold: 0.60)
+    static let balanced100 = DetectionPreset(title: "標準 100", maxBoxes: 100, confThresh: 0.15, minAreaPt: 20*20, useNMS: true,  iouThreshold: 0.55)
+    static let aggressive120 = DetectionPreset(title: "拡張 120", maxBoxes: 120, confThresh: 0.20, minAreaPt: 22*22, useNMS: true,  iouThreshold: 0.50)
+    static let all: [DetectionPreset] = [.comfort80, .balanced100, .aggressive120]
+}
+
 // MARK: - View
 
 struct ContentView: View {
     @StateObject private var vm = CameraVM()
+    @State private var nearFocusOn = true
     
     var body: some View {
         ZStack {
             CameraPreview(session: vm.session) { layer in
                 vm.previewLayer = layer
-                // 起動は modelReady のみ（ここでは start しない）
             }
             .ignoresSafeArea()
 
-            PillOverlay(boxes: vm.boxes)
+            PillOverlay(boxes: vm.boxes, showLabels: true)
 
-            VStack {
-                HStack { Spacer(); CountBadge(count: vm.boxes.count).padding() }
+            // HUD & メニュー
+            VStack(spacing: 8) {
+                HStack {
+                    // プリセット切替メニュー（左上）
+                    Menu {
+                        ForEach(DetectionPreset.all) { p in
+                            Button {
+                                vm.selectedPreset = p
+                            } label: {
+                                if vm.selectedPreset == p {
+                                    Label(p.title, systemImage: "checkmark")
+                                } else {
+                                    Text(p.title)
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "slider.horizontal.3")
+                            Text(vm.selectedPreset.title)
+                        }
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(.ultraThinMaterial)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    
+                    // ContentView のHUD近くに
+
+                    Button {
+                        nearFocusOn.toggle()
+                        vm.setNearFocus(nearFocusOn)
+                    } label: {
+                        Label(nearFocusOn ? "近距離AF ON" : "近距離AF OFF", systemImage: "viewfinder")
+                    }
+                    .buttonStyle(.bordered)
+                    
+                    Spacer()
+                    // FPS HUD（右上）
+                    HUDView(fps: vm.actualFPS, shown: vm.boxes.count, maxShown: vm.selectedPreset.maxBoxes)
+                }
+                .padding(.horizontal, 12).padding(.top, 12)
                 Spacer()
             }
 
@@ -50,7 +105,6 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            // 初回体験向上：起動直後に権限ダイアログを出しておく（未決定のみ）
             if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
                 AVCaptureDevice.requestAccess(for: .video) { _ in }
             }
@@ -64,7 +118,6 @@ struct ContentView: View {
         // iOS17の onChange 新シグネチャ（2引数）
         .onChange(of: vm.modelReady) { _, ready in
             if ready, vm.previewLayer != nil {
-                // レイアウト安定のため少し遅らせる（ハング抑制）
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { vm.start() }
             }
         }
@@ -74,18 +127,41 @@ struct ContentView: View {
         } message: {
             Text(vm.errorMessage ?? "")
         }
+        
+        
+    }
+}
+
+
+
+// MARK: - HUD
+
+struct HUDView: View {
+    let fps: Double
+    let shown: Int
+    let maxShown: Int
+    var body: some View {
+        HStack(spacing: 10) {
+            Label(String(format: "FPS %.1f", fps), systemImage: "speedometer")
+            Text("Pills \(shown)/\(maxShown)")
+        }
+        .font(.caption)
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
 
 // MARK: - ViewModel
 
 final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-
     // 出力
     @Published var boxes: [DrawBox] = []
     @Published var cameraDenied = false
     @Published var modelReady = false
     @Published var errorMessage: String?
+    @Published var actualFPS: Double = 0.0
+    @Published var selectedPreset: DetectionPreset = .comfort80   // ← デフォルト：80
 
     // カメラ
     let session = AVCaptureSession()
@@ -98,30 +174,26 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
 
     // Vision
     private var request: VNCoreMLRequest?
-    private var didSetupRequest = false  // 二重構築ガード
-    private let confThresh: VNConfidence = 0.10
-
-    // 実行制御
+    private var didSetupRequest = false
+    // スロットリング & UI
     private let inferSemaphore = DispatchSemaphore(value: 1)
     private var lastInferTime = CFAbsoluteTimeGetCurrent()
     private var targetFPS: Double = 3.0 { didSet { inferInterval = 1.0 / max(1.0, targetFPS) } }
-    private var inferInterval: CFTimeInterval = 1.0 / 3.0 // ≈3fps
+    private var inferInterval: CFTimeInterval = 1.0 / 3.0
     private var lastUIUpdate = CFAbsoluteTimeGetCurrent()
-    private let uiInterval: CFTimeInterval = 0.10    // UI は最大 10fps
+    private let uiInterval: CFTimeInterval = 0.10
+    private var lastPerfTime = CFAbsoluteTimeGetCurrent() // FPS算出用
 
-    // ピクセルバッファ寸法（回転後）
+    // 画像サイズ（回転後）
     private var lastPixelBufferSize: CGSize?
-
-    // 使用カメラの向き（オリエンテーション変換で使用）
+    // 使用カメラ
     private var devicePosition: AVCaptureDevice.Position = .back
 
     override init() {
         super.init()
-        // カメラ構成はメインをブロックしない
         sessionQueue.async { [weak self] in
             self?.setupCamera()
         }
-        // モデル非同期ロード（端末状態に合わせて計算資源を選択）
         setupVision()
     }
 
@@ -165,7 +237,6 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         session.beginConfiguration()
         session.sessionPreset = .vga640x480
 
-        // 背面広角
         guard let cam = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: cam) else {
             session.commitConfiguration()
@@ -177,7 +248,6 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
 
         do {
             try cam.lockForConfiguration()
-            // 12fps ロック（遅延と発熱のバランス）
             if cam.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.maxFrameRate >= 12 }) {
                 cam.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 12)
                 cam.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 12)
@@ -199,12 +269,10 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         if session.canAddOutput(output) { session.addOutput(output) }
         if let conn = output.connection(with: .video) {
             if #available(iOS 17.0, *) {
-                // iOS17+: 回転角ベース
                 if conn.isVideoRotationAngleSupported(90) {
                     conn.videoRotationAngle = 90
                 }
             } else if conn.isVideoOrientationSupported {
-                // iOS16-: 旧API
                 conn.videoOrientation = .portrait
             }
         }
@@ -213,7 +281,6 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
 
     // MARK: Vision/CoreML
 
-    // バンドル内の .mlmodelc を優先。なければ .mlpackage をコンパイル
     private func urlForCompiledModel() -> URL? {
         let bundle = Bundle.main
         if let urls = bundle.urls(forResourcesWithExtension: "mlmodelc", subdirectory: nil),
@@ -243,19 +310,18 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         print("[DEBUG] setupVision(): staged MLModel.load start (no blocking)")
         guard let url = urlForCompiledModel() else { return }
 
-        // 🔁 低電力モードで tier の優先を切替
+        // 低電力モードでロード優先度を切替
         let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
         let tiers: [MLComputeUnits] = lowPower
-        ? [.cpuOnly, .cpuAndGPU, .all]   // 省電力優先
-        : [.all, .cpuAndGPU, .cpuOnly]   // 性能優先
+        ? [.cpuOnly, .cpuAndGPU, .all]
+        : [.all, .cpuAndGPU, .cpuOnly]
 
         let timeoutSec: Double = 6
         var completed = false
 
         func tryLoad(at index: Int) {
             guard index < tiers.count, !completed else { return }
-            let cfg = MLModelConfiguration()
-            cfg.computeUnits = tiers[index]
+            let cfg = MLModelConfiguration(); cfg.computeUnits = tiers[index]
             MLModel.load(contentsOf: url, configuration: cfg) { [weak self] result in
                 guard let self, !completed else { return }
                 switch result {
@@ -268,7 +334,6 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                     tryLoad(at: index + 1)
                 }
             }
-            // タイムアウトで次 tier を試す（成功/失敗で completed が立つ）
             DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeoutSec) {
                 if !completed { tryLoad(at: index + 1) }
             }
@@ -276,7 +341,6 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         tryLoad(at: 0)
     }
 
-    // VNCoreMLModel を作って Request 構築
     private func buildVNModelAndRequest(_ model: MLModel) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -294,11 +358,7 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     }
 
     private func buildVisionRequest(_ vnModel: VNCoreMLModel) {
-        // 二重実行ガード
-        if didSetupRequest {
-            print("[DEBUG] buildVisionRequest skipped (already set)")
-            return
-        }
+        if didSetupRequest { return }
         didSetupRequest = true
 
         let req = VNCoreMLRequest(model: vnModel) { [weak self] request, _ in
@@ -309,40 +369,32 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             guard now - self.lastUIUpdate >= self.uiInterval else { return }
             self.lastUIUpdate = now
 
-            // レイヤー変換＋UI 更新はメインへ
             DispatchQueue.main.async {
                 guard let pl = self.previewLayer else { return }
                 self.boxes = self.convertToLayerRects(obs, previewLayer: pl)
             }
         }
-
-        // ⚠️ usesCPUOnly は iOS17 で非推奨 → 使わない
-        // 省電力対応は MLModelConfiguration.computeUnits 側で解決済み
-
-        // YOLO の前処理に合わせて調整（学習が letterbox なら .scaleFit が近い）
+        // 学習に合わせて選択（letterbox なら .scaleFit）
         req.imageCropAndScaleOption = .scaleFill
 
         self.request = req
         print("[DEBUG] request built ✅")
 
-        // ウォームアップ（BG）
+        // Warm-up
         inferQueue.async { [weak self] in
             guard let self else { return }
             self.warmUp()
-            print("[DEBUG] warmUp done (background)")
             DispatchQueue.main.async {
                 self.modelReady = true
-                print("[DEBUG] modelReady = true (after warmUp) ✅")
             }
         }
     }
 
-    // 初回だけダミー入力で perform（Metal/BNNS 初期化）
     private func warmUp() {
         guard let req = self.request else { return }
         if let pb = Self.makePixelBuffer(width: 320, height: 320) {
             let h = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .up, options: [:])
-            _ = try? h.perform([req]) // 結果は捨てる
+            _ = try? h.perform([req])
         }
     }
 
@@ -351,17 +403,13 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard modelReady, let request = self.request else { return }
 
-        // 実フレームのピクセル寸法を更新（回転に応じて入替）
+        // 画像サイズ（回転に応じて入替）
         if let pixel = CMSampleBufferGetImageBuffer(sb) {
             let w = CVPixelBufferGetWidth(pixel)
             let h = CVPixelBufferGetHeight(pixel)
             if #available(iOS 17.0, *) {
                 let rot = (Int(connection.videoRotationAngle) % 360 + 360) % 360
-                if rot == 90 || rot == 270 {
-                    lastPixelBufferSize = CGSize(width: h, height: w)
-                } else {
-                    lastPixelBufferSize = CGSize(width: w, height: h)
-                }
+                lastPixelBufferSize = (rot == 90 || rot == 270) ? CGSize(width: h, height: w) : CGSize(width: w, height: h)
             } else {
                 switch connection.videoOrientation {
                 case .portrait, .portraitUpsideDown:
@@ -381,35 +429,38 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         guard inferSemaphore.wait(timeout: .now()) == .success else { return }
 
         inferQueue.async { [weak self] in
-            defer { self?.inferSemaphore.signal() }
             guard let self = self else { return }
+            defer { self.inferSemaphore.signal() }
 
-            // オリエンテーションを "回転角×カメラ位置" から決定
+            // Vision のオリエンテーション（プレビューと整合のため 180°補正）
             let orient = self.cgImageOrientation(for: connection, devicePosition: self.devicePosition)
 
-            // sampleBuffer から直接 handler を生成（余計なコピーを避ける）
+            let t0 = CFAbsoluteTimeGetCurrent()
             let handler = VNImageRequestHandler(cmSampleBuffer: sb, orientation: orient, options: [:])
             do {
                 try handler.perform([request])
             } catch {
                 print("[ERROR] VN perform:", error.localizedDescription)
             }
+            let t1 = CFAbsoluteTimeGetCurrent()
+
+            // 実測FPS（EMA）
+            let dt = max(1e-3, t1 - self.lastPerfTime)
+            self.lastPerfTime = t1
+            let instFPS = 1.0 / dt
+            DispatchQueue.main.async {
+                self.actualFPS = self.actualFPS * 0.9 + instFPS * 0.1
+            }
         }
     }
 
-    // MARK: Orientation (rotation-angle based for iOS17)
+    // MARK: Orientation（iOS17: rotationAngle + 180°補正）
 
-    // CameraVM 内：置き換え
-    private func cgImageOrientation(
-        for connection: AVCaptureConnection,
-        devicePosition: AVCaptureDevice.Position
-    ) -> CGImagePropertyOrientation {
+    private func cgImageOrientation(for connection: AVCaptureConnection, devicePosition: AVCaptureDevice.Position) -> CGImagePropertyOrientation {
         let isFront = (devicePosition == .front)
-
-        // 1) 回転角を取得（iOS17+ は videoRotationAngle、旧OSは videoOrientation から推定）
         var angle: Int
         if #available(iOS 17.0, *) {
-            angle = Int(connection.videoRotationAngle) % 360          // 0 / 90 / 180 / 270
+            angle = Int(connection.videoRotationAngle) % 360
         } else {
             switch connection.videoOrientation {
             case .portrait:            angle = 90
@@ -419,11 +470,8 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             @unknown default:          angle = 90
             }
         }
-
-        // 2) ★ ここが肝心：プレビューとのズレを解消するために 180°補正
+        // 180°補正（プレビューと整合）
         let adjusted = (angle + 180) % 360
-
-        // 3) 角度＋前面/背面で CGImagePropertyOrientation を決定
         switch adjusted {
         case 0:   return isFront ? .upMirrored    : .up
         case 90:  return isFront ? .leftMirrored  : .right
@@ -433,37 +481,62 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         }
     }
 
-    // MARK: 座標変換（PreviewLayer API を優先）
+    // MARK: 座標変換（Y反転→公式変換 + NMS/制限）
 
-    // CameraVM 内：置き換え
     private func convertToLayerRects(
         _ obs: [VNRecognizedObjectObservation],
         previewLayer pl: AVCaptureVideoPreviewLayer
     ) -> [DrawBox] {
-        var rects: [DrawBox] = []
-        for o in obs.sorted(by: { $0.confidence > $1.confidence }).prefix(40) {
-            guard o.confidence >= self.confThresh else { continue }
+        let preset = selectedPreset
+        guard !obs.isEmpty else { return [] }
 
+        // 1) スコア順 → まずは上位を広めに確保
+        var rects: [DrawBox] = []
+        for o in obs.sorted(by: { $0.confidence > $1.confidence }).prefix(max(preset.maxBoxes * 2, preset.maxBoxes)) {
+            guard o.confidence >= preset.confThresh else { continue }
             // Vision 正規化（左下原点）→ メタデータ座標（左上原点）へ反転
             let v = o.boundingBox
-            let normTop = CGRect(
-                x: v.minX,
-                y: 1 - v.minY - v.height,       // ← y だけ反転（ここ重要）
-                width: v.width,
-                height: v.height
-            )
-
-            // メタデータ(0..1, 左上原点) → レイヤ座標へ公式変換
-            let layerRect = pl.layerRectConverted(fromMetadataOutputRect: normTop)
+            let meta = CGRect(x: v.minX,
+                              y: 1 - v.minY - v.height,
+                              width: v.width,
+                              height: v.height)
+            // メタデータ(0..1, 左上原点) → レイヤ座標
+            let layerRect = pl.layerRectConverted(fromMetadataOutputRect: meta)
             let clipped = layerRect.intersection(pl.bounds)
-            guard clipped.width >= 16, clipped.height >= 16 else { continue }
+            guard clipped.width >= 1, clipped.height >= 1 else { continue }
+            // 最小面積
+            guard (clipped.width * clipped.height) >= preset.minAreaPt else { continue }
 
             rects.append(DrawBox(rect: clipped,
                                  score: o.confidence,
                                  label: o.labels.first?.identifier ?? "pill"))
+            if rects.count >= preset.maxBoxes * 2 { break }
         }
-        return rects
+
+        // 2) 簡易NMS（オプション）
+        if preset.useNMS {
+            var kept: [DrawBox] = []
+            for b in rects.sorted(by: { $0.score > $1.score }) {
+                if kept.allSatisfy({ iou($0.rect, b.rect) < preset.iouThreshold }) {
+                    kept.append(b)
+                    if kept.count >= preset.maxBoxes { break }
+                }
+            }
+            return kept
+        } else {
+            return Array(rects.sorted(by: { $0.score > $1.score }).prefix(preset.maxBoxes))
+        }
     }
+
+    private func iou(_ a: CGRect, _ b: CGRect) -> CGFloat {
+        let inter = a.intersection(b)
+        if inter.isNull || inter.isEmpty { return 0 }
+        let ia = inter.width * inter.height
+        let ua = (a.width*a.height) + (b.width*b.height) - ia
+        if ua <= 0 { return 0 }
+        return ia / ua
+    }
+
     // MARK: Utils
 
     private static func makePixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
@@ -474,6 +547,27 @@ final class CameraVM: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         ] as CFDictionary
         CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &pb)
         return pb
+    }
+    
+    // CameraVM 内
+    func setNearFocus(_ on: Bool) {
+        sessionQueue.async { [weak self] in
+            guard let self,
+                  let cam = self.session.inputs.compactMap({ $0 as? AVCaptureDeviceInput }).first?.device
+            else { return }
+            do {
+                try cam.lockForConfiguration()
+                if cam.isAutoFocusRangeRestrictionSupported {
+                    cam.autoFocusRangeRestriction = on ? .near : .none
+                }
+                if cam.isFocusModeSupported(.continuousAutoFocus) {
+                    cam.focusMode = .continuousAutoFocus
+                } else if cam.isFocusModeSupported(.autoFocus) {
+                    cam.focusMode = .autoFocus
+                }
+                cam.unlockForConfiguration()
+            } catch { print("[FOCUS] lock failed:", error.localizedDescription) }
+        }
     }
 }
 
@@ -502,22 +596,21 @@ struct CameraPreview: UIViewRepresentable {
     }
 }
 
-// MARK: - Overlay（軽量 Canvas + ラベル）
+// MARK: - Overlay（小枠はラベル省略）
 
 struct PillOverlay: View {
     let boxes: [DrawBox]
+    let showLabels: Bool
     var body: some View {
         Canvas { ctx, _ in
             let sorted = boxes.sorted { $0.score > $1.score }
-            let maxRects = sorted.prefix(40)
-
-            for b in maxRects where (b.rect.width * b.rect.height) >= 16 * 16 {
+            for b in sorted {
                 // 枠
-                let p = Path(CGRect(x: b.rect.minX, y: b.rect.minY,
-                                    width: b.rect.width, height: b.rect.height))
+                let p = Path(CGRect(x: b.rect.minX, y: b.rect.minY, width: b.rect.width, height: b.rect.height))
                 ctx.stroke(p, with: .color(.green), lineWidth: 2)
 
-                // ラベル
+                // 小さい枠はラベル省略（描画負荷を抑える）
+                guard showLabels, b.rect.width >= 28, b.rect.height >= 14 else { continue }
                 let text = "\(b.label) \(Int(b.score * 100))%"
                 let layout = Text(AttributedString(text))
                     .font(.caption)
@@ -530,20 +623,7 @@ struct PillOverlay: View {
     }
 }
 
-// MARK: - カウント表示
-
-struct CountBadge: View {
-    let count: Int
-    var body: some View {
-        Text("Pills: \(count)")
-            .font(.headline)
-            .padding(10)
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 10))
-    }
-}
-
-// MARK: - 描画用モデル
+// MARK: - モデル
 
 struct DrawBox: Hashable {
     var rect: CGRect
